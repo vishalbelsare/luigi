@@ -32,7 +32,7 @@ These files are meant for both the client and ``luigid``.
 If you decide to specify your own configuration you should make sure
 that both the client and ``luigid`` load it properly.
 
-.. _ConfigParser.read: https://docs.python.org/3.6/library/configparser.html#configparser.ConfigParser.read
+.. _ConfigParser.read: https://docs.python.org/3/library/configparser.html#configparser.ConfigParser.read
 
 The config file is broken into sections, each controlling a different part of the config.
 
@@ -168,24 +168,6 @@ log_level
 logging_conf_file
   Location of the logging configuration file.
 
-max_shown_tasks
-  .. versionadded:: 1.0.20
-
-  The maximum number of tasks returned in a task_list api call. This
-  will restrict the number of tasks shown in task lists in the
-  visualiser. Small values can alleviate frozen browsers when there are
-  too many done tasks. This defaults to 100000 (one hundred thousand).
-
-max_graph_nodes
-  .. versionadded:: 2.0.0
-
-  The maximum number of nodes returned by a dep_graph or
-  inverse_dep_graph api call. Small values can greatly speed up graph
-  display in the visualiser by limiting the number of nodes shown. Some
-  of the nodes that are not sent to the visualiser will still show up as
-  dependencies of nodes that were sent. These nodes are given TRUNCATED
-  status.
-
 no_configure_logging
   If true, logging is not configured. Defaults to false.
 
@@ -289,6 +271,10 @@ task_limit
   thus far. Prevents incidents due to spamming of the scheduler, usually
   accidental. Default: no limit.
 
+task_process_context
+  An optional setting allowing Luigi to import a custom context manager
+  used to wrap the execution of tasks' run methods. Default: no context manager.
+
 timeout
   .. versionadded:: 1.0.20
 
@@ -374,6 +360,15 @@ check_complete_on_run
   missing.
   Defaults to false.
 
+cache_task_completion
+  By default, luigi task processes might check the completion status multiple
+  times per task which is a safe way to avoid potential inconsistencies. For
+  tasks with many dynamic dependencies, yielded in multiple stages, this might
+  become expensive, e.g. in case the per-task completion check entails remote
+  resources. When set to true, completion checks are cached so that tasks
+  declared as complete once are not checked again.
+  Defaults to false.
+
 
 [elasticsearch]
 ---------------
@@ -441,13 +436,13 @@ traceback_max_length
   Maximum length for traceback included in error email. Default is 5000.
 
 
-[batch_notifier]
+[batch_email]
 ----------------
 
 Parameters controlling the contents of batch notifications sent from the
 scheduler
 
-email_interval_minutes
+email_interval
   Number of minutes between e-mail sends. Making this larger results in
   fewer, bigger e-mails.
   Defaults to 60.
@@ -646,6 +641,18 @@ marker_table
   created if it doesn't already exist. Defaults to "table_updates".
 
 
+[prometheus]
+------------
+
+use_task_family_in_labels
+  Should task family be used as a prometheus bucket label.
+  Default value is true.
+
+task_parameters_to_use_in_labels
+  List of task arguments' names used as additional prometheus bucket labels.
+  Passed in a form of a json list.
+
+
 [redshift]
 ----------
 
@@ -789,6 +796,24 @@ disable_window
   scheduler forgets about disables that have occurred longer ago than
   this amount of time. Defaults to 3600 (1 hour).
 
+max_shown_tasks
+  .. versionadded:: 1.0.20
+
+  The maximum number of tasks returned in a task_list api call. This
+  will restrict the number of tasks shown in task lists in the
+  visualiser. Small values can alleviate frozen browsers when there are
+  too many done tasks. This defaults to 100000 (one hundred thousand).
+
+max_graph_nodes
+  .. versionadded:: 2.0.0
+
+  The maximum number of nodes returned by a dep_graph or
+  inverse_dep_graph api call. Small values can greatly speed up graph
+  display in the visualiser by limiting the number of nodes shown. Some
+  of the nodes that are not sent to the visualiser will still show up as
+  dependencies of nodes that were sent. These nodes are given TRUNCATED
+  status.
+
 record_task_history
   If true, stores task history in a database. Defaults to false.
 
@@ -836,7 +861,12 @@ metrics_collector
   Optional setting allowing Luigi to use a contribution to collect metrics
   about the pipeline to a third-party. By default this uses the default metric
   collector that acts as a shell and does nothing. The currently available
-  options are "datadog" and "prometheus".
+  options are "datadog", "prometheus" and "custom". If it's custom the
+  'metrics_custom_import' needs to be set.
+
+metrics_custom_import
+  Optional setting allowing Luigi to import a custom subclass of MetricsCollector
+  at runtime. The string should be formatted like "module.sub_module.ClassName".
 
 
 [sendgrid]
@@ -1030,6 +1060,7 @@ statsd_port
 metric_namespace
   Optional prefix to add to the beginning of every metric sent to Datadog.
   Default value is "luigi".
+
 
 Per Task Retry-Policy
 ---------------------

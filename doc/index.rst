@@ -22,17 +22,16 @@ Table of Contents
    configuration.rst
    logging.rst
    design_and_limitations.rst
+   mypy.rst
 
 API Reference
 -------------
 
 .. autosummary::
    :toctree: api
+   :recursive:
 
    luigi
-   luigi.contrib
-   luigi.tools
-   luigi.local_target
 
 
 Indices and tables

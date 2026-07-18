@@ -25,26 +25,24 @@ import tempfile
 import threading
 import time
 
+import mock
 import psutil
-from helpers import (unittest, with_config, skipOnTravisAndGithubActions, LuigiTestCase,
-                     temporary_unloaded_module)
+from helpers import LuigiTestCase, skipOnTravisAndGithubActions, temporary_unloaded_module, unittest, with_config
 
 import luigi.notifications
 import luigi.task_register
 import luigi.worker
-import mock
-from luigi import ExternalTask, RemoteScheduler, Task, Event
-from luigi.mock import MockTarget, MockFileSystem
+from luigi import Event, ExternalTask, RemoteScheduler, Task
+from luigi.cmdline import luigi_run
+from luigi.mock import MockFileSystem, MockTarget
+from luigi.rpc import RPCError
 from luigi.scheduler import Scheduler
 from luigi.worker import Worker
-from luigi.rpc import RPCError
-from luigi.cmdline import luigi_run
 
 luigi.notifications.DEBUG = True
 
 
 class DummyTask(Task):
-
     def __init__(self, *args, **kwargs):
         super(DummyTask, self).__init__(*args, **kwargs)
         self.has_run = False
@@ -59,18 +57,19 @@ class DummyTask(Task):
 
 class DynamicDummyTask(Task):
     p = luigi.Parameter()
+    sleep = luigi.FloatParameter(default=0.5, significant=False)
 
     def output(self):
         return luigi.LocalTarget(self.p)
 
     def run(self):
-        with self.output().open('w') as f:
-            f.write('Done!')
-        time.sleep(0.5)  # so we can benchmark & see if parallelization works
+        with self.output().open("w") as f:
+            f.write("Done!")
+        time.sleep(self.sleep)  # so we can benchmark & see if parallelization works
 
 
 class DynamicDummyTaskWithNamespace(DynamicDummyTask):
-    task_namespace = 'banana'
+    task_namespace = "banana"
 
 
 class DynamicRequires(Task):
@@ -78,36 +77,63 @@ class DynamicRequires(Task):
     use_banana_task = luigi.BoolParameter(default=False)
 
     def output(self):
-        return luigi.LocalTarget(os.path.join(self.p, 'parent'))
+        return luigi.LocalTarget(os.path.join(self.p, "parent"))
 
     def run(self):
         if self.use_banana_task:
             task_cls = DynamicDummyTaskWithNamespace
         else:
             task_cls = DynamicDummyTask
-        dummy_targets = yield [task_cls(os.path.join(self.p, str(i)))
-                               for i in range(5)]
-        dummy_targets += yield [task_cls(os.path.join(self.p, str(i)))
-                                for i in range(5, 7)]
-        with self.output().open('w') as f:
+        dummy_targets = yield [task_cls(os.path.join(self.p, str(i))) for i in range(5)]
+        dummy_targets += yield [task_cls(os.path.join(self.p, str(i))) for i in range(5, 7)]
+        with self.output().open("w") as f:
             for i, d in enumerate(dummy_targets):
-                for line in d.open('r'):
-                    print('%d: %s' % (i, line.strip()), file=f)
+                for line in d.open("r"):
+                    print("%d: %s" % (i, line.strip()), file=f)
+
+
+class DynamicRequiresWrapped(Task):
+    p = luigi.Parameter()
+
+    def output(self):
+        return luigi.LocalTarget(os.path.join(self.p, "parent"))
+
+    def run(self):
+        reqs = [DynamicDummyTask(p=os.path.join(self.p, "%s.txt" % i), sleep=0.0) for i in range(10)]
+
+        # yield again as DynamicRequires
+        yield luigi.DynamicRequirements(reqs)
+
+        # and again with a custom complete function that does base name comparisons
+        def custom_complete(complete_fn):
+            if not complete_fn(reqs[0]):
+                return False
+            paths = [task.output().path for task in reqs]
+            basenames = os.listdir(os.path.dirname(paths[0]))
+            self._custom_complete_called = True
+            self._custom_complete_result = all(os.path.basename(path) in basenames for path in paths)
+            return self._custom_complete_result
+
+        yield luigi.DynamicRequirements(reqs, custom_complete)
+
+        with self.output().open("w") as f:
+            f.write("Done!")
 
 
 class DynamicRequiresOtherModule(Task):
     p = luigi.Parameter()
 
     def output(self):
-        return luigi.LocalTarget(os.path.join(self.p, 'baz'))
+        return luigi.LocalTarget(os.path.join(self.p, "baz"))
 
     def run(self):
         import other_module
-        other_target_foo = yield other_module.OtherModuleTask(os.path.join(self.p, 'foo'))  # NOQA
-        other_target_bar = yield other_module.OtherModuleTask(os.path.join(self.p, 'bar'))  # NOQA
 
-        with self.output().open('w') as f:
-            f.write('Done!')
+        other_target_foo = yield other_module.OtherModuleTask(os.path.join(self.p, "foo"))  # NOQA
+        other_target_bar = yield other_module.OtherModuleTask(os.path.join(self.p, "bar"))  # NOQA
+
+        with self.output().open("w") as f:
+            f.write("Done!")
 
 
 class DummyErrorTask(Task):
@@ -119,11 +145,10 @@ class DummyErrorTask(Task):
 
 
 class WorkerTest(LuigiTestCase):
-
     def run(self, result=None):
         self.sch = Scheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10, stable_done_cooldown_secs=0)
         self.time = time.time
-        with Worker(scheduler=self.sch, worker_id='X') as w, Worker(scheduler=self.sch, worker_id='Y') as w2:
+        with Worker(scheduler=self.sch, worker_id="X") as w, Worker(scheduler=self.sch, worker_id="Y") as w2:
             self.w = w
             self.w2 = w2
             super(WorkerTest, self).run(result)
@@ -136,16 +161,15 @@ class WorkerTest(LuigiTestCase):
 
     def test_dep(self):
         class A(Task):
-
             def run(self):
                 self.has_run = True
 
             def complete(self):
                 return self.has_run
+
         a = A()
 
         class B(Task):
-
             def requires(self):
                 return a
 
@@ -166,13 +190,12 @@ class WorkerTest(LuigiTestCase):
 
     def test_external_dep(self):
         class A(ExternalTask):
-
             def complete(self):
                 return False
+
         a = A()
 
         class B(Task):
-
             def requires(self):
                 return a
 
@@ -202,11 +225,13 @@ class WorkerTest(LuigiTestCase):
 
             def complete(self):
                 return self.has_run
+
         a = A()
 
         class B(A):
             def requires(self):
                 return luigi.task.externalize(a)
+
         b = B()
 
         self.assertTrue(self.w.add(b))
@@ -224,12 +249,14 @@ class WorkerTest(LuigiTestCase):
 
             def complete(self):
                 return self.has_run
+
         a = A()
         a.run = NotImplemented
 
         class B(A):
             def requires(self):
                 return a
+
         b = B()
 
         self.assertTrue(self.w.add(b))
@@ -247,7 +274,7 @@ class WorkerTest(LuigiTestCase):
 
             def run(self, tracking_url_callback=None):
                 self.num_runs += 1
-                raise TypeError('bad type')
+                raise TypeError("bad type")
 
         a = A()
         self.assertTrue(self.w.add(a))
@@ -257,7 +284,7 @@ class WorkerTest(LuigiTestCase):
         self.assertEqual(1, a.num_runs)
 
     def test_tracking_url(self):
-        tracking_url = 'http://test_url.com/'
+        tracking_url = "http://test_url.com/"
 
         class A(Task):
             has_run = False
@@ -272,9 +299,9 @@ class WorkerTest(LuigiTestCase):
         a = A()
         self.assertTrue(self.w.add(a))
         self.assertTrue(self.w.run())
-        tasks = self.sch.task_list('DONE', '')
+        tasks = self.sch.task_list("DONE", "")
         self.assertEqual(1, len(tasks))
-        self.assertEqual(tracking_url, tasks[a.task_id]['tracking_url'])
+        self.assertEqual(tracking_url, tasks[a.task_id]["tracking_url"])
 
     def test_fail(self):
         class CustomException(BaseException):
@@ -282,10 +309,9 @@ class WorkerTest(LuigiTestCase):
                 self.msg = msg
 
         class A(Task):
-
             def run(self):
                 self.has_run = True
-                raise CustomException('bad things')
+                raise CustomException("bad things")
 
             def complete(self):
                 return self.has_run
@@ -293,7 +319,6 @@ class WorkerTest(LuigiTestCase):
         a = A()
 
         class B(Task):
-
             def requires(self):
                 return a
 
@@ -317,18 +342,15 @@ class WorkerTest(LuigiTestCase):
     def test_unknown_dep(self):
         # see related test_remove_dep test (grep for it)
         class A(ExternalTask):
-
             def complete(self):
                 return False
 
         class C(Task):
-
             def complete(self):
                 return True
 
         def get_b(dep):
             class B(Task):
-
                 def requires(self):
                     return dep
 
@@ -358,7 +380,6 @@ class WorkerTest(LuigiTestCase):
 
     def test_unfulfilled_dep(self):
         class A(Task):
-
             def complete(self):
                 return self.done
 
@@ -367,9 +388,9 @@ class WorkerTest(LuigiTestCase):
 
         def get_b(a):
             class B(A):
-
                 def requires(self):
                     return a
+
             b = B()
             b.done = False
             a.done = True
@@ -386,7 +407,6 @@ class WorkerTest(LuigiTestCase):
 
     def test_check_unfulfilled_deps_config(self):
         class A(Task):
-
             i = luigi.IntParameter()
 
             def __init__(self, *args, **kwargs):
@@ -402,12 +422,11 @@ class WorkerTest(LuigiTestCase):
                 self.has_run = True
 
         class B(A):
-
             def requires(self):
                 return A(i=self.i)
 
         # test the enabled features
-        with Worker(scheduler=self.sch, worker_id='1') as w:
+        with Worker(scheduler=self.sch, worker_id="1") as w:
             w._config.check_unfulfilled_deps = True
             a1 = A(i=1)
             b1 = B(i=1)
@@ -421,7 +440,7 @@ class WorkerTest(LuigiTestCase):
             self.assertEqual(b1.complete_count, 2)
 
         # test the disabled features
-        with Worker(scheduler=self.sch, worker_id='2') as w:
+        with Worker(scheduler=self.sch, worker_id="2") as w:
             w._config.check_unfulfilled_deps = False
             a2 = A(i=2)
             b2 = B(i=2)
@@ -433,6 +452,86 @@ class WorkerTest(LuigiTestCase):
             self.assertTrue(b2.complete())
             self.assertEqual(a2.complete_count, 2)
             self.assertEqual(b2.complete_count, 2)
+
+    def test_cache_task_completion_config(self):
+        class A(Task):
+            i = luigi.IntParameter()
+
+            def __init__(self, *args, **kwargs):
+                super(A, self).__init__(*args, **kwargs)
+                self.complete_count = 0
+                self.has_run = False
+
+            def complete(self):
+                self.complete_count += 1
+                return self.has_run
+
+            def run(self):
+                self.has_run = True
+
+        class B(A):
+            def run(self):
+                yield A(i=self.i + 0)
+                yield A(i=self.i + 1)
+                yield A(i=self.i + 2)
+                self.has_run = True
+
+        # test with enabled cache_task_completion
+        with Worker(scheduler=self.sch, worker_id="2", cache_task_completion=True) as w:
+            b0 = B(i=0)
+            a0 = A(i=0)
+            a1 = A(i=1)
+            a2 = A(i=2)
+            self.assertTrue(w.add(b0))
+            # a's are required dynamically, so their counts must be 0
+            self.assertEqual(b0.complete_count, 1)
+            self.assertEqual(a0.complete_count, 0)
+            self.assertEqual(a1.complete_count, 0)
+            self.assertEqual(a2.complete_count, 0)
+            w.run()
+            # the complete methods of a's yielded first in b's run method were called equally often
+            self.assertEqual(b0.complete_count, 1)
+            self.assertEqual(a0.complete_count, 2)
+            self.assertEqual(a1.complete_count, 2)
+            self.assertEqual(a2.complete_count, 2)
+
+        # test with disabled cache_task_completion
+        with Worker(scheduler=self.sch, worker_id="2", cache_task_completion=False) as w:
+            b10 = B(i=10)
+            a10 = A(i=10)
+            a11 = A(i=11)
+            a12 = A(i=12)
+            self.assertTrue(w.add(b10))
+            # a's are required dynamically, so their counts must be 0
+            self.assertEqual(b10.complete_count, 1)
+            self.assertEqual(a10.complete_count, 0)
+            self.assertEqual(a11.complete_count, 0)
+            self.assertEqual(a12.complete_count, 0)
+            w.run()
+            # the complete methods of a's yielded first in b's run method were called more often
+            self.assertEqual(b10.complete_count, 1)
+            self.assertEqual(a10.complete_count, 5)
+            self.assertEqual(a11.complete_count, 4)
+            self.assertEqual(a12.complete_count, 3)
+
+        # test with enabled check_complete_on_run
+        with Worker(scheduler=self.sch, worker_id="2", check_complete_on_run=True) as w:
+            b20 = B(i=20)
+            a20 = A(i=20)
+            a21 = A(i=21)
+            a22 = A(i=22)
+            self.assertTrue(w.add(b20))
+            # a's are required dynamically, so their counts must be 0
+            self.assertEqual(b20.complete_count, 1)
+            self.assertEqual(a20.complete_count, 0)
+            self.assertEqual(a21.complete_count, 0)
+            self.assertEqual(a22.complete_count, 0)
+            w.run()
+            # the complete methods of a's yielded first in b's run method were called more often
+            self.assertEqual(b20.complete_count, 2)
+            self.assertEqual(a20.complete_count, 6)
+            self.assertEqual(a21.complete_count, 5)
+            self.assertEqual(a22.complete_count, 4)
 
     def test_gets_missed_work(self):
         class A(Task):
@@ -448,19 +547,17 @@ class WorkerTest(LuigiTestCase):
         self.assertTrue(self.w.add(a))
 
         # simulate a missed get_work response
-        self.assertEqual(a.task_id, self.sch.get_work(worker='X')['task_id'])
+        self.assertEqual(a.task_id, self.sch.get_work(worker="X")["task_id"])
 
         self.assertTrue(self.w.run())
         self.assertTrue(a.complete())
 
     def test_avoid_infinite_reschedule(self):
         class A(Task):
-
             def complete(self):
                 return False
 
         class B(Task):
-
             def complete(self):
                 return False
 
@@ -471,14 +568,14 @@ class WorkerTest(LuigiTestCase):
         self.assertFalse(self.w.run())
 
     def test_fails_registering_signal(self):
-        with mock.patch('luigi.worker.signal', spec=['signal']):
+        with mock.patch("luigi.worker.signal", spec=["signal"]):
             # mock will raise an attribute error getting signal.SIGUSR1
             Worker()
 
     def test_allow_reschedule_with_many_missing_deps(self):
         class A(Task):
+            """Task that must run twice to succeed"""
 
-            """ Task that must run twice to succeed """
             i = luigi.IntParameter()
 
             runs = 0
@@ -502,7 +599,7 @@ class WorkerTest(LuigiTestCase):
                 self.done = True
 
         b = B()
-        w = Worker(scheduler=self.sch, worker_id='X', max_reschedules=1)
+        w = Worker(scheduler=self.sch, worker_id="X", max_reschedules=1)
         self.assertTrue(w.add(b))
         self.assertFalse(w.run())
 
@@ -517,7 +614,6 @@ class WorkerTest(LuigiTestCase):
         a = A()
 
         class B(DummyTask):
-
             def requires(self):
                 return a
 
@@ -528,7 +624,7 @@ class WorkerTest(LuigiTestCase):
         self.assertEqual(str(eb), "B()")
 
         sch = Scheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10)
-        with Worker(scheduler=sch, worker_id='X') as w, Worker(scheduler=sch, worker_id='Y') as w2:
+        with Worker(scheduler=sch, worker_id="X") as w, Worker(scheduler=sch, worker_id="Y") as w2:
             self.assertTrue(w.add(b))
             self.assertTrue(w2.add(eb))
             logging.debug("RUNNING BROKEN WORKER")
@@ -553,7 +649,7 @@ class WorkerTest(LuigiTestCase):
         self.assertEqual(str(eb), "B()")
 
         sch = Scheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10)
-        with Worker(scheduler=sch, worker_id='X') as w, Worker(scheduler=sch, worker_id='Y') as w2:
+        with Worker(scheduler=sch, worker_id="X") as w, Worker(scheduler=sch, worker_id="Y") as w2:
             self.assertTrue(w2.add(eb))
             self.assertTrue(w.add(b))
 
@@ -564,29 +660,27 @@ class WorkerTest(LuigiTestCase):
 
     def test_interleaved_workers3(self):
         class A(DummyTask):
-
             def run(self):
-                logging.debug('running A')
+                logging.debug("running A")
                 time.sleep(0.1)
                 super(A, self).run()
 
         a = A()
 
         class B(DummyTask):
-
             def requires(self):
                 return a
 
             def run(self):
-                logging.debug('running B')
+                logging.debug("running B")
                 super(B, self).run()
 
         b = B()
 
         sch = Scheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10)
 
-        with Worker(scheduler=sch, worker_id='X', keep_alive=True, count_uniques=True) as w:
-            with Worker(scheduler=sch, worker_id='Y', keep_alive=True, count_uniques=True, wait_interval=0.1, wait_jitter=0.05) as w2:
+        with Worker(scheduler=sch, worker_id="X", keep_alive=True, count_uniques=True) as w:
+            with Worker(scheduler=sch, worker_id="Y", keep_alive=True, count_uniques=True, wait_interval=0.1, wait_jitter=0.05) as w2:
                 self.assertTrue(w.add(a))
                 self.assertTrue(w2.add(b))
 
@@ -598,29 +692,27 @@ class WorkerTest(LuigiTestCase):
 
     def test_die_for_non_unique_pending(self):
         class A(DummyTask):
-
             def run(self):
-                logging.debug('running A')
+                logging.debug("running A")
                 time.sleep(0.1)
                 super(A, self).run()
 
         a = A()
 
         class B(DummyTask):
-
             def requires(self):
                 return a
 
             def run(self):
-                logging.debug('running B')
+                logging.debug("running B")
                 super(B, self).run()
 
         b = B()
 
         sch = Scheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10)
 
-        with Worker(scheduler=sch, worker_id='X', keep_alive=True, count_uniques=True) as w:
-            with Worker(scheduler=sch, worker_id='Y', keep_alive=True, count_uniques=True, wait_interval=0.1, wait_jitter=0.05) as w2:
+        with Worker(scheduler=sch, worker_id="X", keep_alive=True, count_uniques=True) as w:
+            with Worker(scheduler=sch, worker_id="Y", keep_alive=True, count_uniques=True, wait_interval=0.1, wait_jitter=0.05) as w2:
                 self.assertTrue(w.add(b))
                 self.assertTrue(w2.add(b))
 
@@ -632,8 +724,8 @@ class WorkerTest(LuigiTestCase):
 
     def test_complete_exception(self):
         "Tests that a task is still scheduled if its sister task crashes in the complete() method"
-        class A(DummyTask):
 
+        class A(DummyTask):
             def complete(self):
                 raise Exception("doh")
 
@@ -645,7 +737,6 @@ class WorkerTest(LuigiTestCase):
         c = C()
 
         class B(DummyTask):
-
             def requires(self):
                 return a, c
 
@@ -660,7 +751,6 @@ class WorkerTest(LuigiTestCase):
 
     def test_requires_exception(self):
         class A(DummyTask):
-
             def requires(self):
                 raise Exception("doh")
 
@@ -678,7 +768,6 @@ class WorkerTest(LuigiTestCase):
         c = C()
 
         class B(DummyTask):
-
             def requires(self):
                 return c, a
 
@@ -696,15 +785,15 @@ class WorkerTest(LuigiTestCase):
         completed = set()
 
         class CsvBatchJob(luigi.Task):
-            values = luigi.parameter.Parameter(batch_method=','.join)
+            values = luigi.parameter.Parameter(batch_method=",".join)
             has_run = False
 
             def run(self):
-                completed.update(self.values.split(','))
+                completed.update(self.values.split(","))
                 self.has_run = True
 
             def complete(self):
-                return all(value in completed for value in self.values.split(','))
+                return all(value in completed for value in self.values.split(","))
 
         tasks = [CsvBatchJob(str(i)) for i in range(10)]
         for task in tasks:
@@ -769,17 +858,17 @@ class WorkerTest(LuigiTestCase):
         runs = []
 
         class CsvLimitedBatchJob(luigi.Task):
-            value = luigi.parameter.Parameter(batch_method=','.join)
+            value = luigi.parameter.Parameter(batch_method=",".join)
             has_run = False
 
             max_batch_size = 4
 
             def run(self):
-                completed.update(self.value.split(','))
+                completed.update(self.value.split(","))
                 runs.append(self)
 
             def complete(self):
-                return all(value in completed for value in self.value.split(','))
+                return all(value in completed for value in self.value.split(","))
 
         tasks = [CsvLimitedBatchJob(str(i)) for i in range(11)]
         for task in tasks:
@@ -812,7 +901,7 @@ class WorkerTest(LuigiTestCase):
             # only task number 9 should run
             self.assertFalse(task.has_run and task.value < 9)
 
-        self.assertEqual({task.task_id for task in tasks}, set(self.sch.task_list('FAILED', '')))
+        self.assertEqual({task.task_id for task in tasks}, set(self.sch.task_list("FAILED", "")))
 
     def test_gracefully_handle_batch_method_failure(self):
         class BadBatchMethodTask(DummyTask):
@@ -845,9 +934,9 @@ class WorkerTest(LuigiTestCase):
             self.assertTrue(self.w.add(task))
         self.assertFalse(self.w.run())
 
-        failed_ids = set(self.sch.task_list('FAILED', ''))
+        failed_ids = set(self.sch.task_list("FAILED", ""))
         self.assertEqual({task.task_id for task in tasks}, failed_ids)
-        self.assertTrue(all(self.sch.fetch_error(task_id)['error'] for task_id in failed_ids))
+        self.assertTrue(all(self.sch.fetch_error(task_id)["error"] for task_id in failed_ids))
 
 
 class WorkerKeepAliveTests(LuigiTestCase):
@@ -856,14 +945,16 @@ class WorkerKeepAliveTests(LuigiTestCase):
         super(WorkerKeepAliveTests, self).setUp()
 
     def _worker_keep_alive_test(self, first_should_live, second_should_live, task_status=None, **worker_args):
-        worker_args.update({
-            'scheduler': self.sch,
-            'worker_processes': 0,
-            'wait_interval': 0.01,
-            'wait_jitter': 0.0,
-        })
-        w1 = Worker(worker_id='w1', **worker_args)
-        w2 = Worker(worker_id='w2', **worker_args)
+        worker_args.update(
+            {
+                "scheduler": self.sch,
+                "worker_processes": 0,
+                "wait_interval": 0.01,
+                "wait_jitter": 0.0,
+            }
+        )
+        w1 = Worker(worker_id="w1", **worker_args)
+        w2 = Worker(worker_id="w2", **worker_args)
         with w1 as worker1, w2 as worker2:
             worker1.add(DummyTask())
             t1 = threading.Thread(target=worker1.run)
@@ -874,7 +965,7 @@ class WorkerKeepAliveTests(LuigiTestCase):
             t2.start()
 
             if task_status:
-                self.sch.add_task(worker='DummyWorker', task_id=DummyTask().task_id, status=task_status)
+                self.sch.add_task(worker="DummyWorker", task_id=DummyTask().task_id, status=task_status)
 
             # allow workers to run their get work loops a few times
             time.sleep(0.1)
@@ -885,7 +976,7 @@ class WorkerKeepAliveTests(LuigiTestCase):
 
             finally:
                 # mark the task done so the worker threads will die
-                self.sch.add_task(worker='DummyWorker', task_id=DummyTask().task_id, status='DONE')
+                self.sch.add_task(worker="DummyWorker", task_id=DummyTask().task_id, status="DONE")
                 t1.join()
                 t2.join()
 
@@ -923,7 +1014,7 @@ class WorkerKeepAliveTests(LuigiTestCase):
             first_should_live=True,
             second_should_live=True,
             keep_alive=True,
-            task_status='FAILED',
+            task_status="FAILED",
         )
 
     def test_do_not_keep_alive_through_disable(self):
@@ -931,7 +1022,7 @@ class WorkerKeepAliveTests(LuigiTestCase):
             first_should_live=False,
             second_should_live=False,
             keep_alive=True,
-            task_status='DISABLED',
+            task_status="DISABLED",
         )
 
 
@@ -939,8 +1030,7 @@ class WorkerInterruptedTest(unittest.TestCase):
     def setUp(self):
         self.sch = Scheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10)
 
-    requiring_sigusr = unittest.skipUnless(hasattr(signal, 'SIGUSR1'),
-                                           'signal.SIGUSR1 not found on this system')
+    requiring_sigusr = unittest.skipUnless(hasattr(signal, "SIGUSR1"), "signal.SIGUSR1 not found on this system")
 
     def _test_stop_getting_new_work(self, worker):
         d = DummyTask()
@@ -953,18 +1043,15 @@ class WorkerInterruptedTest(unittest.TestCase):
 
     @requiring_sigusr
     def test_stop_getting_new_work(self):
-        self._test_stop_getting_new_work(
-            Worker(scheduler=self.sch))
+        self._test_stop_getting_new_work(Worker(scheduler=self.sch))
 
     @requiring_sigusr
     def test_stop_getting_new_work_assistant(self):
-        self._test_stop_getting_new_work(
-            Worker(scheduler=self.sch, keep_alive=False, assistant=True))
+        self._test_stop_getting_new_work(Worker(scheduler=self.sch, keep_alive=False, assistant=True))
 
     @requiring_sigusr
     def test_stop_getting_new_work_assistant_keep_alive(self):
-        self._test_stop_getting_new_work(
-            Worker(scheduler=self.sch, keep_alive=True, assistant=True))
+        self._test_stop_getting_new_work(Worker(scheduler=self.sch, keep_alive=True, assistant=True))
 
     def test_existence_of_disabling_option(self):
         # any code equivalent of `os.kill(os.getpid(), signal.SIGUSR1)`
@@ -975,6 +1062,7 @@ class WorkerInterruptedTest(unittest.TestCase):
     def test_can_run_luigi_in_thread(self):
         class A(DummyTask):
             pass
+
         task = A()
         # Note that ``signal.signal(signal.SIGUSR1, fn)`` can only be called in the main thread.
         # So if we do not disable the shutdown handler, this would fail.
@@ -993,11 +1081,12 @@ class WorkerDisabledTest(LuigiTestCase):
         I got motivated to create this test case when I saw that the
         execution_summary crashed after my first attempted solution.
         """
+
         class KillWorkerTask(luigi.Task):
             did_actually_run = False
 
             def run(self):
-                sch.disable_worker('my_worker_id')
+                sch.disable_worker("my_worker_id")
                 KillWorkerTask.did_actually_run = True
 
         class Factory:
@@ -1015,19 +1104,19 @@ class WorkerDisabledTest(LuigiTestCase):
         with worker:
             worker.add(d)  # For assistant its ok that other tasks add it
             self.assertFalse(d.complete())
-            sch.disable_worker('my_worker_id')
+            sch.disable_worker("my_worker_id")
             worker.run()  # Note: Test could fail by hanging on this line
             self.assertFalse(d.complete())
 
     def _test_stop_getting_new_work(self, **worker_kwargs):
-        worker_kwargs['worker_id'] = 'my_worker_id'
+        worker_kwargs["worker_id"] = "my_worker_id"
 
         sch = self.make_sch()
-        worker_kwargs['scheduler'] = sch
+        worker_kwargs["scheduler"] = sch
         self._test_stop_getting_new_work_manual(sch, Worker(**worker_kwargs))
 
         sch = self.make_sch()
-        worker_kwargs['scheduler'] = sch
+        worker_kwargs["scheduler"] = sch
         self._test_stop_getting_new_work_build(sch, Worker(**worker_kwargs))
 
     def test_stop_getting_new_work_keep_alive(self):
@@ -1040,9 +1129,9 @@ class WorkerDisabledTest(LuigiTestCase):
         self._test_stop_getting_new_work(keep_alive=True, assistant=True)
 
 
-class DynamicDependenciesTest(unittest.TestCase):
+class DynamicDependenciesTest(LuigiTestCase):
     n_workers = 1
-    timeout = float('inf')
+    timeout = float("inf")
 
     def setUp(self):
         self.p = tempfile.mkdtemp()
@@ -1057,9 +1146,9 @@ class DynamicDependenciesTest(unittest.TestCase):
         self.assertTrue(t.complete())
 
         # loop through output and verify
-        with t.output().open('r') as f:
+        with t.output().open("r") as f:
             for i in range(7):
-                self.assertEqual(f.readline().strip(), '%d: Done!' % i)
+                self.assertEqual(f.readline().strip(), "%d: Done!" % i)
 
         self.assertTrue(time.time() - t0 < self.timeout)
 
@@ -1071,16 +1160,22 @@ class DynamicDependenciesTest(unittest.TestCase):
         luigi.build([t], local_scheduler=True, workers=self.n_workers)
         self.assertTrue(t.complete())
 
+    def test_wrapped_dynamic_requirements(self):
+        t = DynamicRequiresWrapped(p=self.p)
+        luigi.build([t], local_scheduler=True, workers=1)
+        self.assertTrue(t.complete())
+        self.assertTrue(getattr(t, "_custom_complete_called", False))
+        self.assertTrue(getattr(t, "_custom_complete_result", False))
+
 
 class DynamicDependenciesWithMultipleWorkersTest(DynamicDependenciesTest):
     n_workers = 100
-    timeout = 3.0  # We run 7 tasks that take 0.5s each so it should take less than 3.5s
+    timeout = 10.0  # We run 7 tasks that take 0.5s each so it should take less than 3.5s
 
 
 class WorkerPingThreadTests(unittest.TestCase):
-
     def test_ping_retry(self):
-        """ Worker ping fails once. Ping continues to try to connect to scheduler
+        """Worker ping fails once. Ping continues to try to connect to scheduler
 
         Kind of ugly since it uses actual timing with sleep to test the thread
         """
@@ -1100,16 +1195,13 @@ class WorkerPingThreadTests(unittest.TestCase):
         sch.ping = fail_ping
 
         with Worker(
-                scheduler=sch,
-                worker_id="foo",
-                ping_interval=0.01  # very short between pings to make test fast
-                ):
+            scheduler=sch,
+            worker_id="foo",
+            ping_interval=0.01,  # very short between pings to make test fast
+        ):
             # let the keep-alive thread run for a bit...
             time.sleep(0.1)  # yes, this is ugly but it's exactly what we need to test
-        self.assertTrue(
-            self._total_pings > 1,
-            msg="Didn't retry pings (%d pings performed)" % (self._total_pings,)
-        )
+        self.assertTrue(self._total_pings > 1, msg="Didn't retry pings (%d pings performed)" % (self._total_pings,))
 
     def test_ping_thread_shutdown(self):
         with Worker(ping_interval=0.01) as w:
@@ -1128,7 +1220,7 @@ def email_patch(test_func, email_config=None):
 
     @with_config(EMAIL_CONFIG)
     @functools.wraps(test_func)
-    @mock.patch('smtplib.SMTP')
+    @mock.patch("smtplib.SMTP")
     def run_test(self, smtp):
         smtp().sendmail.side_effect = mock_send_email
         test_func(self, emails)
@@ -1141,7 +1233,6 @@ def custom_email_patch(config):
 
 
 class WorkerEmailTest(LuigiTestCase):
-
     def run(self, result=None):
         super(WorkerEmailTest, self).setUp()
         sch = Scheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10)
@@ -1150,7 +1241,7 @@ class WorkerEmailTest(LuigiTestCase):
 
     @email_patch
     def test_connection_error(self, emails):
-        sch = RemoteScheduler('http://tld.invalid:1337', connect_timeout=1)
+        sch = RemoteScheduler("http://tld.invalid:1337", connect_timeout=1)
         sch._rpc_retry_wait = 1  # shorten wait time to speed up tests
 
         class A(DummyTask):
@@ -1171,7 +1262,6 @@ class WorkerEmailTest(LuigiTestCase):
     @email_patch
     def test_complete_error(self, emails):
         class A(DummyTask):
-
             def complete(self):
                 raise Exception("b0rk")
 
@@ -1183,7 +1273,7 @@ class WorkerEmailTest(LuigiTestCase):
         self.assertTrue(emails[0].find("Luigi: %s failed scheduling" % (a,)) != -1)
         self.assertFalse(a.has_run)
 
-    @with_config({'batch_email': {'email_interval': '0'}, 'worker': {'send_failure_email': 'False'}})
+    @with_config({"batch_email": {"email_interval": "0"}, "worker": {"send_failure_email": "False"}})
     @email_patch
     def test_complete_error_email_batch(self, emails):
         class A(DummyTask):
@@ -1202,11 +1292,11 @@ class WorkerEmailTest(LuigiTestCase):
         scheduler.prune()
         self.assertTrue("1 scheduling failure" in emails[0])
 
-    @with_config({'batch_email': {'email_interval': '0'}, 'worker': {'send_failure_email': 'False'}})
+    @with_config({"batch_email": {"email_interval": "0"}, "worker": {"send_failure_email": "False"}})
     @email_patch
     def test_complete_error_email_batch_to_owner(self, emails):
         class A(DummyTask):
-            owner_email = 'a_owner@test.com'
+            owner_email = "a_owner@test.com"
 
             def complete(self):
                 raise Exception("b0rk")
@@ -1221,15 +1311,13 @@ class WorkerEmailTest(LuigiTestCase):
         self.assertEqual(emails, [])
         self.assertFalse(a.has_run)
         scheduler.prune()
-        self.assertTrue(any(
-            "1 scheduling failure" in email and 'a_owner@test.com' in email
-            for email in emails))
+        self.assertTrue(any("1 scheduling failure" in email and "a_owner@test.com" in email for email in emails))
 
     @email_patch
     def test_announce_scheduling_failure_unexpected_error(self, emails):
 
         class A(DummyTask):
-            owner_email = 'a_owner@test.com'
+            owner_email = "a_owner@test.com"
 
             def complete(self):
                 pass
@@ -1238,17 +1326,15 @@ class WorkerEmailTest(LuigiTestCase):
         worker = Worker(scheduler)
         a = A()
 
-        with mock.patch.object(worker._scheduler, 'announce_scheduling_failure', side_effect=Exception('Unexpected')),\
-                self.assertRaises(Exception):
+        with mock.patch.object(worker._scheduler, "announce_scheduling_failure", side_effect=Exception("Unexpected")), self.assertRaises(Exception):
             worker.add(a)
         self.assertTrue(len(emails) == 2)  # One for `complete` error, one for exception in announcing.
-        self.assertTrue('Luigi: Framework error while scheduling' in emails[1])
-        self.assertTrue('a_owner@test.com' in emails[1])
+        self.assertTrue("Luigi: Framework error while scheduling" in emails[1])
+        self.assertTrue("a_owner@test.com" in emails[1])
 
     @email_patch
     def test_requires_error(self, emails):
         class A(DummyTask):
-
             def requires(self):
                 raise Exception("b0rk")
 
@@ -1259,11 +1345,10 @@ class WorkerEmailTest(LuigiTestCase):
         self.worker.run()
         self.assertFalse(a.has_run)
 
-    @with_config({'batch_email': {'email_interval': '0'}, 'worker': {'send_failure_email': 'False'}})
+    @with_config({"batch_email": {"email_interval": "0"}, "worker": {"send_failure_email": "False"}})
     @email_patch
     def test_requires_error_email_batch(self, emails):
         class A(DummyTask):
-
             def requires(self):
                 raise Exception("b0rk")
 
@@ -1281,7 +1366,6 @@ class WorkerEmailTest(LuigiTestCase):
     @email_patch
     def test_complete_return_value(self, emails):
         class A(DummyTask):
-
             def complete(self):
                 pass  # no return value should be an error
 
@@ -1293,11 +1377,10 @@ class WorkerEmailTest(LuigiTestCase):
         self.assertTrue(emails[0].find("Luigi: %s failed scheduling" % (a,)) != -1)
         self.assertFalse(a.has_run)
 
-    @with_config({'batch_email': {'email_interval': '0'}, 'worker': {'send_failure_email': 'False'}})
+    @with_config({"batch_email": {"email_interval": "0"}, "worker": {"send_failure_email": "False"}})
     @email_patch
     def test_complete_return_value_email_batch(self, emails):
         class A(DummyTask):
-
             def complete(self):
                 pass  # no return value should be an error
 
@@ -1328,47 +1411,49 @@ class WorkerEmailTest(LuigiTestCase):
     def test_run_error_long_traceback(self, emails):
         class A(luigi.Task):
             def run(self):
-                raise Exception("b0rk"*10500)
+                raise Exception("b0rk" * 10500)
 
         a = A()
         luigi.build([a], workers=1, local_scheduler=True)
         self.assertTrue(len(emails[0]) < 10000)
         self.assertTrue(emails[0].find("Traceback exceeds max length and has been truncated"))
 
-    @with_config({'batch_email': {'email_interval': '0'}, 'worker': {'send_failure_email': 'False'}})
+    @with_config({"batch_email": {"email_interval": "0"}, "worker": {"send_failure_email": "False"}})
     @email_patch
     def test_run_error_email_batch(self, emails):
         class A(luigi.Task):
-            owner_email = ['a@test.com', 'b@test.com']
+            owner_email = ["a@test.com", "b@test.com"]
 
             def run(self):
                 raise Exception("b0rk")
+
         scheduler = Scheduler(batch_emails=True)
         worker = Worker(scheduler)
         worker.add(A())
         worker.run()
         scheduler.prune()
         self.assertEqual(3, len(emails))
-        self.assertTrue(any('a@test.com' in email for email in emails))
-        self.assertTrue(any('b@test.com' in email for email in emails))
+        self.assertTrue(any("a@test.com" in email for email in emails))
+        self.assertTrue(any("b@test.com" in email for email in emails))
 
-    @with_config({'batch_email': {'email_interval': '0'}, 'worker': {'send_failure_email': 'False'}})
+    @with_config({"batch_email": {"email_interval": "0"}, "worker": {"send_failure_email": "False"}})
     @email_patch
     def test_run_error_batch_email_string(self, emails):
         class A(luigi.Task):
-            owner_email = 'a@test.com'
+            owner_email = "a@test.com"
 
             def run(self):
                 raise Exception("b0rk")
+
         scheduler = Scheduler(batch_emails=True)
         worker = Worker(scheduler)
         worker.add(A())
         worker.run()
         scheduler.prune()
         self.assertEqual(2, len(emails))
-        self.assertTrue(any('a@test.com' in email for email in emails))
+        self.assertTrue(any("a@test.com" in email for email in emails))
 
-    @with_config({'worker': {'send_failure_email': 'False'}})
+    @with_config({"worker": {"send_failure_email": "False"}})
     @email_patch
     def test_run_error_no_email(self, emails):
         class A(luigi.Task):
@@ -1381,7 +1466,7 @@ class WorkerEmailTest(LuigiTestCase):
     @staticmethod
     def read_email(email_msg):
         subject_obj, body_obj = email.parser.Parser().parsestr(email_msg).walk()
-        return str(subject_obj['Subject']), str(body_obj.get_payload(decode=True))
+        return str(subject_obj["Subject"]), str(body_obj.get_payload(decode=True))
 
     @email_patch
     def test_task_process_dies_with_email(self, emails):
@@ -1392,7 +1477,7 @@ class WorkerEmailTest(LuigiTestCase):
         self.assertIn("Luigi: {} FAILED".format(a), subject)
         self.assertIn("died unexpectedly with exit code -9", body)
 
-    @with_config({'worker': {'send_failure_email': 'False'}})
+    @with_config({"worker": {"send_failure_email": "False"}})
     @email_patch
     def test_task_process_dies_no_email(self, emails):
         luigi.build([SendSignalTask(signal.SIGKILL)], workers=2, local_scheduler=True)
@@ -1413,7 +1498,7 @@ class WorkerEmailTest(LuigiTestCase):
         self.assertIn("Luigi: %s FAILED" % (a,), subject)
         self.assertIn("timed out after 0.0001 seconds and was terminated.", body)
 
-    @with_config({'worker': {'send_failure_email': 'False'}})
+    @with_config({"worker": {"send_failure_email": "False"}})
     @email_patch
     def test_task_times_out_no_email(self, emails):
         class A(luigi.Task):
@@ -1425,12 +1510,13 @@ class WorkerEmailTest(LuigiTestCase):
         luigi.build([A()], workers=2, local_scheduler=True)
         self.assertEqual([], emails)
 
-    @with_config(dict(worker=dict(retry_external_tasks='true')))
+    @with_config(dict(worker=dict(retry_external_tasks="true")))
     @email_patch
     def test_external_task_retries(self, emails):
         """
         Test that we do not send error emails on the failures of external tasks
         """
+
         class A(luigi.ExternalTask):
             pass
 
@@ -1442,6 +1528,7 @@ class WorkerEmailTest(LuigiTestCase):
     def test_no_error(self, emails):
         class A(DummyTask):
             pass
+
         a = A()
         self.assertEqual(emails, [])
         self.worker.add(a)
@@ -1450,10 +1537,9 @@ class WorkerEmailTest(LuigiTestCase):
         self.assertEqual(emails, [])
         self.assertTrue(a.complete())
 
-    @custom_email_patch({"email": {"receiver": "not-a-real-email-address-for-test-only", 'format': 'none'}})
+    @custom_email_patch({"email": {"receiver": "not-a-real-email-address-for-test-only", "format": "none"}})
     def test_disable_emails(self, emails):
         class A(luigi.Task):
-
             def complete(self):
                 raise Exception("b0rk")
 
@@ -1462,7 +1548,6 @@ class WorkerEmailTest(LuigiTestCase):
 
 
 class RaiseSystemExit(luigi.Task):
-
     def run(self):
         raise SystemExit("System exit!!")
 
@@ -1485,9 +1570,8 @@ class HangTheWorkerTask(luigi.Task):
         return False
 
 
-class MultipleWorkersTest(unittest.TestCase):
-
-    @unittest.skip('Always skip. There are many intermittent failures')
+class MultipleWorkersTest(LuigiTestCase):
+    @unittest.skip("Always skip. There are many intermittent failures")
     def test_multiple_workers(self):
         # Test using multiple workers
         # Also test generating classes dynamically since this may reflect issues with
@@ -1551,7 +1635,7 @@ class MultipleWorkersTest(unittest.TestCase):
             self.assertTrue(is_running())
         self.assertFalse(is_running())
 
-    @mock.patch('luigi.worker.time')
+    @mock.patch("luigi.worker.time")
     def test_no_process_leak_from_repeatedly_running_same_task(self, worker_time):
         with Worker(worker_processes=2) as w:
             hung_task = HangTheWorkerTask()
@@ -1577,8 +1661,8 @@ class MultipleWorkersTest(unittest.TestCase):
     def test_time_out_hung_single_worker(self):
         luigi.build([HangTheWorkerTask(0.1)], workers=1, local_scheduler=True)
 
-    @skipOnTravisAndGithubActions('https://travis-ci.org/spotify/luigi/jobs/72953986')
-    @mock.patch('luigi.worker.time')
+    @skipOnTravisAndGithubActions("https://travis-ci.org/spotify/luigi/jobs/72953986")
+    @mock.patch("luigi.worker.time")
     def test_purge_hung_worker_default_timeout_time(self, mock_time):
         w = Worker(worker_processes=2, wait_interval=0.01, timeout=5)
         mock_time.time.return_value = 0
@@ -1594,8 +1678,8 @@ class MultipleWorkersTest(unittest.TestCase):
         w._handle_next_task()
         self.assertEqual(0, len(w._running_tasks))
 
-    @skipOnTravisAndGithubActions('https://travis-ci.org/spotify/luigi/jobs/76645264')
-    @mock.patch('luigi.worker.time')
+    @skipOnTravisAndGithubActions("https://travis-ci.org/spotify/luigi/jobs/76645264")
+    @mock.patch("luigi.worker.time")
     def test_purge_hung_worker_override_timeout_time(self, mock_time):
         w = Worker(worker_processes=2, wait_interval=0.01, timeout=5)
         mock_time.time.return_value = 0
@@ -1619,21 +1703,21 @@ class Dummy2Task(Task):
         return MockTarget(self.p)
 
     def run(self):
-        f = self.output().open('w')
-        f.write('test')
+        f = self.output().open("w")
+        f.write("test")
         f.close()
 
 
-class AssistantTest(unittest.TestCase):
+class AssistantTest(LuigiTestCase):
     def run(self, result=None):
         self.sch = Scheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10)
-        self.assistant = Worker(scheduler=self.sch, worker_id='Y', assistant=True)
-        with Worker(scheduler=self.sch, worker_id='X') as w:
+        self.assistant = Worker(scheduler=self.sch, worker_id="Y", assistant=True)
+        with Worker(scheduler=self.sch, worker_id="X") as w:
             self.w = w
             super(AssistantTest, self).run(result)
 
     def test_get_work(self):
-        d = Dummy2Task('123')
+        d = Dummy2Task("123")
         self.w.add(d)
 
         self.assertFalse(d.complete())
@@ -1642,29 +1726,30 @@ class AssistantTest(unittest.TestCase):
 
     def test_bad_job_type(self):
         class Dummy3Task(Dummy2Task):
-            task_family = 'UnknownTaskFamily'
+            task_family = "UnknownTaskFamily"
 
-        d = Dummy3Task('123')
+        d = Dummy3Task("123")
         self.w.add(d)
 
         self.assertFalse(d.complete())
         self.assertFalse(self.assistant.run())
         self.assertFalse(d.complete())
-        self.assertEqual(list(self.sch.task_list('FAILED', '').keys()), [d.task_id])
+        self.assertEqual(list(self.sch.task_list("FAILED", "").keys()), [d.task_id])
 
     def test_unimported_job_type(self):
-        MODULE_CONTENTS = b'''
+        MODULE_CONTENTS = b"""
 import luigi
 
 
 class UnimportedTask(luigi.Task):
     def complete(self):
         return False
-'''
+"""
         reg = luigi.task_register.Register._get_reg()
 
         class UnimportedTask(luigi.Task):
             task_module = None  # Set it here, so it's generally settable
+
         luigi.task_register.Register._set_reg(reg)
 
         task = UnimportedTask()
@@ -1672,49 +1757,49 @@ class UnimportedTask(luigi.Task):
         # verify that it can't run the task without the module info necessary to import it
         self.w.add(task)
         self.assertFalse(self.assistant.run())
-        self.assertEqual(list(self.sch.task_list('FAILED', '').keys()), [task.task_id])
+        self.assertEqual(list(self.sch.task_list("FAILED", "").keys()), [task.task_id])
 
         # check that it can import with the right module
         with temporary_unloaded_module(MODULE_CONTENTS) as task.task_module:
             self.w.add(task)
             self.assertTrue(self.assistant.run())
-            self.assertEqual(list(self.sch.task_list('DONE', '').keys()), [task.task_id])
+            self.assertEqual(list(self.sch.task_list("DONE", "").keys()), [task.task_id])
 
     def test_unimported_job_sends_failure_message(self):
         class NotInAssistantTask(luigi.Task):
-            task_family = 'Unknown'
+            task_family = "Unknown"
             task_module = None
 
         task = NotInAssistantTask()
         self.w.add(task)
         self.assertFalse(self.assistant.run())
-        self.assertEqual(list(self.sch.task_list('FAILED', '').keys()), [task.task_id])
-        self.assertTrue(self.sch.fetch_error(task.task_id)['error'])
+        self.assertEqual(list(self.sch.task_list("FAILED", "").keys()), [task.task_id])
+        self.assertTrue(self.sch.fetch_error(task.task_id)["error"])
 
 
 class ForkBombTask(luigi.Task):
     depth = luigi.IntParameter()
     breadth = luigi.IntParameter()
-    p = luigi.Parameter(default=(0, ))  # ehm for some weird reason [0] becomes a tuple...?
+    p = luigi.Parameter(default=(0,))  # ehm for some weird reason [0] becomes a tuple...?
 
     def output(self):
-        return MockTarget('.'.join(map(str, self.p)))
+        return MockTarget(".".join(map(str, self.p)))
 
     def run(self):
-        with self.output().open('w') as f:
-            f.write('Done!')
+        with self.output().open("w") as f:
+            f.write("Done!")
 
     def requires(self):
         if len(self.p) < self.depth:
             for i in range(self.breadth):
-                yield ForkBombTask(self.depth, self.breadth, self.p + (i, ))
+                yield ForkBombTask(self.depth, self.breadth, self.p + (i,))
 
 
 class TaskLimitTest(unittest.TestCase):
     def tearDown(self):
-        MockFileSystem().remove('')
+        MockFileSystem().remove("")
 
-    @with_config({'worker': {'task_limit': '6'}})
+    @with_config({"worker": {"task_limit": "6"}})
     def test_task_limit_exceeded(self):
         w = Worker()
         t = ForkBombTask(3, 2)
@@ -1722,10 +1807,13 @@ class TaskLimitTest(unittest.TestCase):
         w.run()
         self.assertFalse(t.complete())
         leaf_tasks = [ForkBombTask(3, 2, branch) for branch in [(0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1)]]
-        self.assertEqual(3, sum(t.complete() for t in leaf_tasks),
-                         "should have gracefully completed as much as possible even though the single last leaf didn't get scheduled")
+        self.assertEqual(
+            3,
+            sum(t.complete() for t in leaf_tasks),
+            "should have gracefully completed as much as possible even though the single last leaf didn't get scheduled",
+        )
 
-    @with_config({'worker': {'task_limit': '7'}})
+    @with_config({"worker": {"task_limit": "7"}})
     def test_task_limit_not_exceeded(self):
         w = Worker()
         t = ForkBombTask(3, 2)
@@ -1742,7 +1830,6 @@ class TaskLimitTest(unittest.TestCase):
 
 
 class WorkerConfigurationTest(unittest.TestCase):
-
     def test_asserts_for_worker(self):
         """
         Test that Worker() asserts that it's sanely configured
@@ -1752,11 +1839,11 @@ class WorkerConfigurationTest(unittest.TestCase):
 
 
 class WorkerWaitJitterTest(unittest.TestCase):
-    @with_config({'worker': {'wait_jitter': '10.0'}})
+    @with_config({"worker": {"wait_jitter": "10.0"}})
     @mock.patch("random.uniform")
     @mock.patch("time.sleep")
     def test_wait_jitter(self, mock_sleep, mock_random):
-        """ verify configured jitter amount """
+        """verify configured jitter amount"""
         mock_random.return_value = 1.0
 
         w = Worker()
@@ -1773,7 +1860,7 @@ class WorkerWaitJitterTest(unittest.TestCase):
     @mock.patch("random.uniform")
     @mock.patch("time.sleep")
     def test_wait_jitter_default(self, mock_sleep, mock_random):
-        """ verify default jitter is as expected """
+        """verify default jitter is as expected"""
         mock_random.return_value = 1.0
         w = Worker()
         x = w._sleeper()
@@ -1788,7 +1875,6 @@ class WorkerWaitJitterTest(unittest.TestCase):
 
 
 class KeyboardInterruptBehaviorTest(LuigiTestCase):
-
     def test_propagation_when_executing(self):
         """
         Ensure that keyboard interrupts causes luigi to quit when you are
@@ -1796,17 +1882,19 @@ class KeyboardInterruptBehaviorTest(LuigiTestCase):
 
         TODO: Add a test that tests the multiprocessing (--worker >1) case
         """
+
         class KeyboardInterruptTask(luigi.Task):
             def run(self):
                 raise KeyboardInterrupt()
 
-        cmd = 'KeyboardInterruptTask --local-scheduler --no-lock'.split(' ')
+        cmd = "KeyboardInterruptTask --local-scheduler --no-lock".split(" ")
         self.assertRaises(KeyboardInterrupt, luigi_run, cmd)
 
     def test_propagation_when_scheduling(self):
         """
         Test that KeyboardInterrupt causes luigi to quit while scheduling.
         """
+
         class KeyboardInterruptTask(luigi.Task):
             def complete(self):
                 raise KeyboardInterrupt()
@@ -1815,15 +1903,12 @@ class KeyboardInterruptBehaviorTest(LuigiTestCase):
             def complete(self):
                 raise KeyboardInterrupt()
 
-        self.assertRaises(KeyboardInterrupt, luigi_run,
-                          ['KeyboardInterruptTask', '--local-scheduler', '--no-lock'])
-        self.assertRaises(KeyboardInterrupt, luigi_run,
-                          ['ExternalKeyboardInterruptTask', '--local-scheduler', '--no-lock'])
+        self.assertRaises(KeyboardInterrupt, luigi_run, ["KeyboardInterruptTask", "--local-scheduler", "--no-lock"])
+        self.assertRaises(KeyboardInterrupt, luigi_run, ["ExternalKeyboardInterruptTask", "--local-scheduler", "--no-lock"])
 
 
 class WorkerPurgeEventHandlerTest(unittest.TestCase):
-
-    @mock.patch('luigi.worker.ContextManagedTaskProcess')
+    @mock.patch("luigi.worker.ContextManagedTaskProcess")
     def test_process_killed_handler(self, task_proc):
         result = []
 
@@ -1843,7 +1928,7 @@ class WorkerPurgeEventHandlerTest(unittest.TestCase):
 
         self.assertEqual(result, [task])
 
-    @mock.patch('luigi.worker.time')
+    @mock.patch("luigi.worker.time")
     def test_timeout_handler(self, mock_time):
         result = []
 
@@ -1863,7 +1948,7 @@ class WorkerPurgeEventHandlerTest(unittest.TestCase):
 
         self.assertEqual(result, [task])
 
-    @mock.patch('luigi.worker.time')
+    @mock.patch("luigi.worker.time")
     def test_timeout_handler_single_worker(self, mock_time):
         result = []
 
@@ -1893,12 +1978,12 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
 
     def test_with_all_disabled_with_single_worker(self):
         """
-            With this test, a case which has a task (TestWrapperTask), requires two another tasks (TestErrorTask1,TestErrorTask1) which both is failed, is
-            tested.
+        With this test, a case which has a task (TestWrapperTask), requires two another tasks (TestErrorTask1,TestErrorTask1) which both is failed, is
+        tested.
 
-            Task TestErrorTask1 has default retry_count which is 1, but Task TestErrorTask2 has retry_count at task level as 2.
+        Task TestErrorTask1 has default retry_count which is 1, but Task TestErrorTask2 has retry_count at task level as 2.
 
-            This test is running on single worker
+        This test is running on single worker
         """
 
         class TestErrorTask1(DummyErrorTask):
@@ -1917,14 +2002,14 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
 
         wt = TestWrapperTask()
 
-        with Worker(scheduler=self.sch, worker_id='X', keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w1:
+        with Worker(scheduler=self.sch, worker_id="X", keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w1:
             self.assertTrue(w1.add(wt))
 
             self.assertFalse(w1.run())
 
-            self.assertEqual([wt.task_id], list(self.sch.task_list('PENDING', 'UPSTREAM_DISABLED').keys()))
+            self.assertEqual([wt.task_id], list(self.sch.task_list("PENDING", "UPSTREAM_DISABLED").keys()))
 
-            self.assertEqual(sorted([e1.task_id, e2.task_id]), sorted(self.sch.task_list('DISABLED', '').keys()))
+            self.assertEqual(sorted([e1.task_id, e2.task_id]), sorted(self.sch.task_list("DISABLED", "").keys()))
 
             self.assertEqual(0, self.sch._state.get_task(wt.task_id).num_failures())
             self.assertEqual(self.per_task_retry_count, self.sch._state.get_task(e2.task_id).num_failures())
@@ -1932,12 +2017,12 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
 
     def test_with_all_disabled_with_multiple_worker(self):
         """
-            With this test, a case which has a task (TestWrapperTask), requires two another tasks (TestErrorTask1,TestErrorTask1) which both is failed, is
-            tested.
+        With this test, a case which has a task (TestWrapperTask), requires two another tasks (TestErrorTask1,TestErrorTask1) which both is failed, is
+        tested.
 
-            Task TestErrorTask1 has default retry_count which is 1, but Task TestErrorTask2 has retry_count at task level as 2.
+        Task TestErrorTask1 has default retry_count which is 1, but Task TestErrorTask2 has retry_count at task level as 2.
 
-            This test is running on multiple worker
+        This test is running on multiple worker
         """
 
         class TestErrorTask1(DummyErrorTask):
@@ -1956,9 +2041,9 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
 
         wt = TestWrapperTask()
 
-        with Worker(scheduler=self.sch, worker_id='X', keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w1:
-            with Worker(scheduler=self.sch, worker_id='Y', keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w2:
-                with Worker(scheduler=self.sch, worker_id='Z', keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w3:
+        with Worker(scheduler=self.sch, worker_id="X", keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w1:
+            with Worker(scheduler=self.sch, worker_id="Y", keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w2:
+                with Worker(scheduler=self.sch, worker_id="Z", keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w3:
                     self.assertTrue(w1.add(wt))
                     self.assertTrue(w2.add(e2))
                     self.assertTrue(w3.add(e1))
@@ -1967,9 +2052,9 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
                     self.assertFalse(w2.run())
                     self.assertTrue(w1.run())
 
-                    self.assertEqual([wt.task_id], list(self.sch.task_list('PENDING', 'UPSTREAM_DISABLED').keys()))
+                    self.assertEqual([wt.task_id], list(self.sch.task_list("PENDING", "UPSTREAM_DISABLED").keys()))
 
-                    self.assertEqual(sorted([e1.task_id, e2.task_id]), sorted(self.sch.task_list('DISABLED', '').keys()))
+                    self.assertEqual(sorted([e1.task_id, e2.task_id]), sorted(self.sch.task_list("DISABLED", "").keys()))
 
                     self.assertEqual(0, self.sch._state.get_task(wt.task_id).num_failures())
                     self.assertEqual(self.per_task_retry_count, self.sch._state.get_task(e2.task_id).num_failures())
@@ -1977,11 +2062,11 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
 
     def test_with_includes_success_with_single_worker(self):
         """
-            With this test, a case which has a task (TestWrapperTask), requires one (TestErrorTask1) FAILED and one (TestSuccessTask1) SUCCESS, is tested.
+        With this test, a case which has a task (TestWrapperTask), requires one (TestErrorTask1) FAILED and one (TestSuccessTask1) SUCCESS, is tested.
 
-            Task TestSuccessTask1 will be DONE successfully, but Task TestErrorTask1 will be failed and it has retry_count at task level as 2.
+        Task TestSuccessTask1 will be DONE successfully, but Task TestErrorTask1 will be failed and it has retry_count at task level as 2.
 
-            This test is running on single worker
+        This test is running on single worker
         """
 
         class TestSuccessTask1(DummyTask):
@@ -2000,14 +2085,14 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
 
         wt = TestWrapperTask()
 
-        with Worker(scheduler=self.sch, worker_id='X', keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w1:
+        with Worker(scheduler=self.sch, worker_id="X", keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w1:
             self.assertTrue(w1.add(wt))
 
             self.assertFalse(w1.run())
 
-            self.assertEqual([wt.task_id], list(self.sch.task_list('PENDING', 'UPSTREAM_DISABLED').keys()))
-            self.assertEqual([e1.task_id], list(self.sch.task_list('DISABLED', '').keys()))
-            self.assertEqual([s1.task_id], list(self.sch.task_list('DONE', '').keys()))
+            self.assertEqual([wt.task_id], list(self.sch.task_list("PENDING", "UPSTREAM_DISABLED").keys()))
+            self.assertEqual([e1.task_id], list(self.sch.task_list("DISABLED", "").keys()))
+            self.assertEqual([s1.task_id], list(self.sch.task_list("DONE", "").keys()))
 
             self.assertEqual(0, self.sch._state.get_task(wt.task_id).num_failures())
             self.assertEqual(self.per_task_retry_count, self.sch._state.get_task(e1.task_id).num_failures())
@@ -2015,11 +2100,11 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
 
     def test_with_includes_success_with_multiple_worker(self):
         """
-            With this test, a case which has a task (TestWrapperTask), requires one (TestErrorTask1) FAILED and one (TestSuccessTask1) SUCCESS, is tested.
+        With this test, a case which has a task (TestWrapperTask), requires one (TestErrorTask1) FAILED and one (TestSuccessTask1) SUCCESS, is tested.
 
-            Task TestSuccessTask1 will be DONE successfully, but Task TestErrorTask1 will be failed and it has retry_count at task level as 2.
+        Task TestSuccessTask1 will be DONE successfully, but Task TestErrorTask1 will be failed and it has retry_count at task level as 2.
 
-            This test is running on multiple worker
+        This test is running on multiple worker
         """
 
         class TestSuccessTask1(DummyTask):
@@ -2038,9 +2123,9 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
 
         wt = TestWrapperTask()
 
-        with Worker(scheduler=self.sch, worker_id='X', keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w1:
-            with Worker(scheduler=self.sch, worker_id='Y', keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w2:
-                with Worker(scheduler=self.sch, worker_id='Z', keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w3:
+        with Worker(scheduler=self.sch, worker_id="X", keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w1:
+            with Worker(scheduler=self.sch, worker_id="Y", keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w2:
+                with Worker(scheduler=self.sch, worker_id="Z", keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w3:
                     self.assertTrue(w1.add(wt))
                     self.assertTrue(w2.add(e1))
                     self.assertTrue(w3.add(s1))
@@ -2049,9 +2134,9 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
                     self.assertFalse(w2.run())
                     self.assertTrue(w1.run())
 
-                    self.assertEqual([wt.task_id], list(self.sch.task_list('PENDING', 'UPSTREAM_DISABLED').keys()))
-                    self.assertEqual([e1.task_id], list(self.sch.task_list('DISABLED', '').keys()))
-                    self.assertEqual([s1.task_id], list(self.sch.task_list('DONE', '').keys()))
+                    self.assertEqual([wt.task_id], list(self.sch.task_list("PENDING", "UPSTREAM_DISABLED").keys()))
+                    self.assertEqual([e1.task_id], list(self.sch.task_list("DISABLED", "").keys()))
+                    self.assertEqual([s1.task_id], list(self.sch.task_list("DONE", "").keys()))
 
                     self.assertEqual(0, self.sch._state.get_task(wt.task_id).num_failures())
                     self.assertEqual(self.per_task_retry_count, self.sch._state.get_task(e1.task_id).num_failures())
@@ -2059,11 +2144,11 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
 
     def test_with_dynamic_dependencies_with_single_worker(self):
         """
-            With this test, a case includes dependency tasks(TestErrorTask1,TestErrorTask2) which both are failed.
+        With this test, a case includes dependency tasks(TestErrorTask1,TestErrorTask2) which both are failed.
 
-            Task TestErrorTask1 has default retry_count which is 1, but Task TestErrorTask2 has retry_count at task level as 2.
+        Task TestErrorTask1 has default retry_count which is 1, but Task TestErrorTask2 has retry_count at task level as 2.
 
-            This test is running on single worker
+        This test is running on single worker
         """
 
         class TestErrorTask1(DummyErrorTask):
@@ -2091,14 +2176,14 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
 
         wt = TestWrapperTask()
 
-        with Worker(scheduler=self.sch, worker_id='X', keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w1:
+        with Worker(scheduler=self.sch, worker_id="X", keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w1:
             self.assertTrue(w1.add(wt))
 
             self.assertFalse(w1.run())
 
-            self.assertEqual([wt.task_id], list(self.sch.task_list('PENDING', 'UPSTREAM_DISABLED').keys()))
+            self.assertEqual([wt.task_id], list(self.sch.task_list("PENDING", "UPSTREAM_DISABLED").keys()))
 
-            self.assertEqual(sorted([e1.task_id, e2.task_id]), sorted(self.sch.task_list('DISABLED', '').keys()))
+            self.assertEqual(sorted([e1.task_id, e2.task_id]), sorted(self.sch.task_list("DISABLED", "").keys()))
 
             self.assertEqual(0, self.sch._state.get_task(wt.task_id).num_failures())
             self.assertEqual(0, self.sch._state.get_task(s1.task_id).num_failures())
@@ -2107,11 +2192,11 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
 
     def test_with_dynamic_dependencies_with_multiple_workers(self):
         """
-            With this test, a case includes dependency tasks(TestErrorTask1,TestErrorTask2) which both are failed.
+        With this test, a case includes dependency tasks(TestErrorTask1,TestErrorTask2) which both are failed.
 
-            Task TestErrorTask1 has default retry_count which is 1, but Task TestErrorTask2 has retry_count at task level as 2.
+        Task TestErrorTask1 has default retry_count which is 1, but Task TestErrorTask2 has retry_count at task level as 2.
 
-            This test is running on multiple worker
+        This test is running on multiple worker
         """
 
         class TestErrorTask1(DummyErrorTask):
@@ -2139,17 +2224,17 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
 
         wt = TestWrapperTask()
 
-        with Worker(scheduler=self.sch, worker_id='X', keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w1:
-            with Worker(scheduler=self.sch, worker_id='Y', keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w2:
+        with Worker(scheduler=self.sch, worker_id="X", keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w1:
+            with Worker(scheduler=self.sch, worker_id="Y", keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w2:
                 self.assertTrue(w1.add(wt))
                 self.assertTrue(w2.add(s1))
 
                 self.assertTrue(w2.run())
                 self.assertFalse(w1.run())
 
-                self.assertEqual([wt.task_id], list(self.sch.task_list('PENDING', 'UPSTREAM_DISABLED').keys()))
+                self.assertEqual([wt.task_id], list(self.sch.task_list("PENDING", "UPSTREAM_DISABLED").keys()))
 
-                self.assertEqual(sorted([e1.task_id, e2.task_id]), sorted(self.sch.task_list('DISABLED', '').keys()))
+                self.assertEqual(sorted([e1.task_id, e2.task_id]), sorted(self.sch.task_list("DISABLED", "").keys()))
 
                 self.assertEqual(0, self.sch._state.get_task(wt.task_id).num_failures())
                 self.assertEqual(0, self.sch._state.get_task(s1.task_id).num_failures())
@@ -2162,10 +2247,12 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
         - with the scheduler retry policy (disable_window=3), task fails twice and gets disabled
         - with the task retry policy (disable_window=0.5) task never gets into the DISABLED state
         """
+
         class TwoErrorsThenSuccessTask(Task):
             """
             The task is failing two times and then succeeds, waiting 1s before each try
             """
+
             retry_index = 0
             disable_window = None
 
@@ -2178,12 +2265,12 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
         t = TwoErrorsThenSuccessTask()
 
         sch = Scheduler(retry_delay=0.1, retry_count=2, prune_on_get_work=True, disable_window=2)
-        with Worker(scheduler=sch, worker_id='X', keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w:
+        with Worker(scheduler=sch, worker_id="X", keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w:
             self.assertTrue(w.add(t))
             self.assertFalse(w.run())
 
             self.assertEqual(2, t.retry_index)
-            self.assertEqual([t.task_id], list(sch.task_list('DISABLED').keys()))
+            self.assertEqual([t.task_id], list(sch.task_list("DISABLED").keys()))
             self.assertEqual(2, sch._state.get_task(t.task_id).num_failures())
 
         t = TwoErrorsThenSuccessTask()
@@ -2191,11 +2278,11 @@ class PerTaskRetryPolicyBehaviorTest(LuigiTestCase):
         t.disable_window = 0.5
 
         sch = Scheduler(retry_delay=0.1, retry_count=2, prune_on_get_work=True, disable_window=2)
-        with Worker(scheduler=sch, worker_id='X', keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w:
+        with Worker(scheduler=sch, worker_id="X", keep_alive=True, wait_interval=0.1, wait_jitter=0.05) as w:
             self.assertTrue(w.add(t))
             # Worker.run return False even if a task failed first but eventually succeeded.
             self.assertFalse(w.run())
 
             self.assertEqual(3, t.retry_index)
-            self.assertEqual([t.task_id], list(sch.task_list('DONE').keys()))
+            self.assertEqual([t.task_id], list(sch.task_list("DONE").keys()))
             self.assertEqual(1, len(sch._state.get_task(t.task_id).failures))

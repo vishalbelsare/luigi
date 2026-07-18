@@ -20,6 +20,7 @@
 
 import os
 import sys
+
 try:
     # Dill is used for handling pickling and unpickling if there is a deference
     # in server setups between the LSF submission node and the nodes in the
@@ -28,7 +29,8 @@ try:
 except ImportError:
     import pickle
 import logging
-import tarfile
+
+from luigi.safe_extractor import SafeExtractor
 
 
 def do_work_on_compute_node(work_dir):
@@ -52,19 +54,16 @@ def extract_packages_archive(work_dir):
     curdir = os.path.abspath(os.curdir)
 
     os.chdir(work_dir)
-    tar = tarfile.open(package_file)
-    for tarinfo in tar:
-        tar.extract(tarinfo)
-    tar.close()
-    if '' not in sys.path:
-        sys.path.insert(0, '')
+    extractor = SafeExtractor(work_dir)
+    extractor.safe_extract(package_file)
+    if "" not in sys.path:
+        sys.path.insert(0, "")
 
     os.chdir(curdir)
 
 
 def main(args=sys.argv):
-    """Run the work() method from the class instance in the file "job-instance.pickle".
-    """
+    """Run the work() method from the class instance in the file "job-instance.pickle"."""
     try:
         # Set up logging.
         logging.basicConfig(level=logging.WARN)
@@ -77,5 +76,5 @@ def main(args=sys.argv):
         raise
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

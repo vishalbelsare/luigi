@@ -18,8 +18,10 @@
 import os
 import subprocess
 import tempfile
+
 import mock
 from helpers import unittest
+from tenacity import retry, retry_if_result, stop_after_attempt, wait_exponential
 
 import luigi
 import luigi.lock
@@ -29,24 +31,28 @@ luigi.notifications.DEBUG = True
 
 
 class TestCmd(unittest.TestCase):
-
     def test_getpcmd(self):
-        if os.name == 'nt':
+        def _is_empty(cmd):
+            return cmd == ""
+
+        # for CI stability, add retring
+        @retry(retry=retry_if_result(_is_empty), wait=wait_exponential(multiplier=0.2, min=0.1, max=3), stop=stop_after_attempt(3))
+        def _getpcmd(pid):
+            return luigi.lock.getpcmd(pid)
+
+        if os.name == "nt":
             command = ["ping", "1.1.1.1", "-w", "1000"]
         else:
             command = ["sleep", "1"]
 
         external_process = subprocess.Popen(command)
-        result = luigi.lock.getpcmd(external_process.pid)
+        result = _getpcmd(external_process.pid)
 
-        self.assertTrue(
-            result.strip() in ["sleep 1", '[sleep]', 'ping 1.1.1.1 -w 1000']
-        )
+        self.assertTrue(result.strip() in ["sleep 1", "[sleep]", "ping 1.1.1.1 -w 1000"])
         external_process.kill()
 
 
 class LockTest(unittest.TestCase):
-
     def setUp(self):
         self.pid_dir = tempfile.mkdtemp()
         self.pid, self.cmd, self.pid_file = luigi.lock.get_info(self.pid_dir)
@@ -57,57 +63,65 @@ class LockTest(unittest.TestCase):
         os.rmdir(self.pid_dir)
 
     def test_get_info(self):
+        def _is_empty(result):
+            return result[1] == ""  # cmd is empty
+
+        # for CI stability, add retring
+        @retry(retry=retry_if_result(_is_empty), wait=wait_exponential(multiplier=0.2, min=0.1, max=3), stop=stop_after_attempt(3))
+        def _get_info(pid_dir, pid):
+            return luigi.lock.get_info(pid_dir, pid)
+
         try:
-            p = subprocess.Popen(["yes", u"à我ф"], stdout=subprocess.PIPE)
-            pid, cmd, pid_file = luigi.lock.get_info(self.pid_dir, p.pid)
+            p = subprocess.Popen(["yes", "à我ф"], stdout=subprocess.PIPE)
+            pid, cmd, pid_file = _get_info(self.pid_dir, p.pid)
         finally:
             p.kill()
-        self.assertEqual(cmd, u'yes à我ф')
+        self.assertEqual(cmd, "yes à我ф")
 
     def test_acquiring_free_lock(self):
         acquired = luigi.lock.acquire_for(self.pid_dir)
         self.assertTrue(acquired)
 
     def test_acquiring_taken_lock(self):
-        with open(self.pid_file, 'w') as f:
-            f.write('%d\n' % (self.pid, ))
+        with open(self.pid_file, "w") as f:
+            f.write("%d\n" % (self.pid,))
 
         acquired = luigi.lock.acquire_for(self.pid_dir)
         self.assertFalse(acquired)
 
     def test_acquiring_partially_taken_lock(self):
-        with open(self.pid_file, 'w') as f:
-            f.write('%d\n' % (self.pid, ))
+        with open(self.pid_file, "w") as f:
+            f.write("%d\n" % (self.pid,))
 
         acquired = luigi.lock.acquire_for(self.pid_dir, 2)
         self.assertTrue(acquired)
 
         s = os.stat(self.pid_file)
-        self.assertEqual(s.st_mode & 0o777, 0o777)
+        self.assertEqual(s.st_mode & 0o700, 0o700)
 
     def test_acquiring_lock_from_missing_process(self):
         fake_pid = 99999
-        with open(self.pid_file, 'w') as f:
-            f.write('%d\n' % (fake_pid, ))
+        with open(self.pid_file, "w") as f:
+            f.write("%d\n" % (fake_pid,))
 
         acquired = luigi.lock.acquire_for(self.pid_dir)
         self.assertTrue(acquired)
 
         s = os.stat(self.pid_file)
-        self.assertEqual(s.st_mode & 0o777, 0o777)
+        self.assertEqual(s.st_mode & 0o700, 0o700)
 
-    @mock.patch('os.kill')
+    @mock.patch("os.kill")
     def test_take_lock_with_kill(self, kill_fn):
-        with open(self.pid_file, 'w') as f:
-            f.write('%d\n' % (self.pid,))
+        with open(self.pid_file, "w") as f:
+            f.write("%d\n" % (self.pid,))
 
         kill_signal = 77777
         acquired = luigi.lock.acquire_for(self.pid_dir, kill_signal=kill_signal)
         self.assertTrue(acquired)
         kill_fn.assert_called_once_with(self.pid, kill_signal)
 
-    @mock.patch('os.kill')
-    @mock.patch('luigi.lock.getpcmd')
+    @mock.patch("os.kill")
+    @mock.patch("luigi.lock.getpcmd")
     def test_take_lock_has_only_one_extra_life(self, getpcmd, kill_fn):
         def side_effect(pid):
             if pid in [self.pid, self.pid + 1, self.pid + 2]:
@@ -116,8 +130,8 @@ class LockTest(unittest.TestCase):
                 return "echo something_else"
 
         getpcmd.side_effect = side_effect
-        with open(self.pid_file, 'w') as f:
-            f.write('{}\n{}\n'.format(self.pid + 1, self.pid + 2))
+        with open(self.pid_file, "w") as f:
+            f.write("{}\n{}\n".format(self.pid + 1, self.pid + 2))
 
         kill_signal = 77777
         acquired = luigi.lock.acquire_for(self.pid_dir, kill_signal=kill_signal)
@@ -125,7 +139,7 @@ class LockTest(unittest.TestCase):
         kill_fn.assert_any_call(self.pid + 1, kill_signal)
         kill_fn.assert_any_call(self.pid + 2, kill_signal)
 
-    @mock.patch('luigi.lock.getpcmd')
+    @mock.patch("luigi.lock.getpcmd")
     def test_cleans_old_pid_entries(self, getpcmd):
         assert self.pid > 10  # I've never seen so low pids so
         SAME_ENTRIES = {1, 2, 3, 4, 5, self.pid}
@@ -140,11 +154,11 @@ class LockTest(unittest.TestCase):
                 return "echo something_else"
 
         getpcmd.side_effect = side_effect
-        with open(self.pid_file, 'w') as f:
-            f.writelines('{}\n'.format(pid) for pid in ALL_ENTRIES)
+        with open(self.pid_file, "w") as f:
+            f.writelines("{}\n".format(pid) for pid in ALL_ENTRIES)
 
         acquired = luigi.lock.acquire_for(self.pid_dir, num_available=100)
         self.assertTrue(acquired)
 
-        with open(self.pid_file, 'r') as f:
+        with open(self.pid_file, "r") as f:
             self.assertEqual({int(pid_str.strip()) for pid_str in f}, SAME_ENTRIES)
